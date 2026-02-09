@@ -6,11 +6,11 @@ For educational purposes only
 from __future__ import division
 
 import skimage.io
-import skimage.feature
 import skimage.color
 import skimage.transform
 import skimage.util
 import skimage.segmentation
+import skimage.filters
 from skimage.segmentation import felzenszwalb
 
 import numpy as np
@@ -82,9 +82,14 @@ def sim_fill(r1, r2, imsize):
     empty = bbox_area - float(s1) - float(s2)
     return 1.0 - empty / float(imsize)
 
+SIM_WEIGHTS = (1.0, 1.0, 1.0, 1.0)
+
 def calc_sim(r1, r2, imsize):
-    return (sim_colour(r1, r2) + sim_texture(r1, r2)
-            + sim_size(r1, r2, imsize) + sim_fill(r1, r2, imsize))
+    a1, a2, a3, a4 = SIM_WEIGHTS
+    return (a1 * sim_colour(r1, r2)
+            + a2 * sim_texture(r1, r2)
+            + a3 * sim_size(r1, r2, imsize)
+            + a4 * sim_fill(r1, r2, imsize))
 
 def calc_colour_hist(img):
     BINS = 25
@@ -103,25 +108,39 @@ def calc_colour_hist(img):
     return hist
 
 def calc_texture_gradient(img):
-    ret = np.zeros((img.shape[0], img.shape[1], img.shape[2]), dtype=np.float32)
+    """
+    Texture gradient using 8 directional derivatives per channel.
+    Returns (H, W, 24): 8 directions * 3 channels.
+    """
+    h, w, ch = img.shape
+    out = np.zeros((h, w, ch * 8), dtype=np.float32)
 
-    P = 8
-    R = 1
-    for c in range(img.shape[2]):
-        # LBP on each channel
-        lbp = skimage.feature.local_binary_pattern(img[:, :, c], P, R, method="uniform")
-        ret[:, :, c] = lbp.astype(np.float32)
+    for c in range(ch):
+        gx = skimage.filters.sobel_h(img[:, :, c])
+        gy = skimage.filters.sobel_v(img[:, :, c])
+        mag = np.sqrt(gx * gx + gy * gy)
 
-    return ret
+        mmax = mag.max()
+        if mmax > 0:
+            mag = mag / mmax
+
+        theta = np.arctan2(gy, gx)  # [-pi, pi]
+        theta = (theta + 2.0 * np.pi) % (2.0 * np.pi)  # [0, 2pi)
+        bin_idx = np.floor(theta / (2.0 * np.pi) * 8.0).astype(np.int32)
+        bin_idx = np.clip(bin_idx, 0, 7)
+
+        for b in range(8):
+            out[:, :, c * 8 + b] = mag * (bin_idx == b)
+
+    return out
 
 def calc_texture_hist(img):
     BINS = 10
     hist = np.array([], dtype=np.float32)
 
-    # img: (N,3) texture values (LBP codes)
-    # for uniform LBP with P=8, values in [0, 10]
-    for c in range(3):
-        hc, _ = np.histogram(img[:, c], bins=BINS, range=(0.0, float(BINS)))
+    # img: (N, 24) directional gradient magnitudes in [0,1]
+    for c in range(img.shape[1]):
+        hc, _ = np.histogram(img[:, c], bins=BINS, range=(0.0, 1.0))
         hist = np.concatenate([hist, hc.astype(np.float32)])
 
     # L1 normalize
@@ -148,7 +167,7 @@ def extract_regions(img):
     # hsv in [0,1]
     hsv = skimage.color.rgb2hsv(rgb)
 
-    # texture gradient (LBP per channel)
+    # texture gradient (8 directions per channel)
     tex = calc_texture_gradient(hsv)
 
     # build regions
@@ -163,7 +182,7 @@ def extract_regions(img):
         size = int(len(xs))
 
         hsv_pixels = hsv[ys, xs, :]  # (N,3)
-        tex_pixels = tex[ys, xs, :]  # (N,3)
+        tex_pixels = tex[ys, xs, :]  # (N,24)
 
         R[lab] = {
             "min_x": int(min_x),
@@ -231,7 +250,7 @@ def merge_regions(r1, r2):
     return rt
 
 
-def selective_search(image_orig, scale=1.0, sigma=0.8, min_size=50):
+def selective_search(image_orig, scale=1.0, sigma=0.8, min_size=50, max_merges=None):
     '''
     Selective Search for Object Recognition" by J.R.R. Uijlings et al.
     :arg:
@@ -280,6 +299,7 @@ def selective_search(image_orig, scale=1.0, sigma=0.8, min_size=50):
         S[(ai, bi)] = calc_sim(ar, br, imsize)
 
     # Hierarchical search for merging similar regions
+    merges = 0
     while S != {}:
 
         # Get highest similarity
@@ -288,6 +308,9 @@ def selective_search(image_orig, scale=1.0, sigma=0.8, min_size=50):
         # Task 4: Merge corresponding regions. Refer to function "merge_regions"
         t = max(R.keys()) + 1.0
         R[t] = merge_regions(R[i], R[j])
+        merges += 1
+        if max_merges is not None and merges >= max_merges:
+            break
 
         # Task 5: Mark similarities for regions to be removed
         keys_to_delete = []
@@ -342,5 +365,3 @@ def selective_search(image_orig, scale=1.0, sigma=0.8, min_size=50):
         })
     print("Number of region proposals:", len(regions))
     return image, regions
-
-
